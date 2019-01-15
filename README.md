@@ -1,4 +1,4 @@
-# CS-546--Narrative-QA
+# Narrative-QA
 
 ### Preprocessing
 1: python -m squad.prepro_nqa
