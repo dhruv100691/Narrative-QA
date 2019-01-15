@@ -1,0 +1,324 @@
+import argparse
+import json
+import os
+import pandas as pd
+# data: q, cq, (dq), (pq), y, *x, *cx
+# shared: x, cx, (dx), (px), word_counter, char_counter, word2vec
+# no metadata
+from collections import Counter
+
+from tqdm import tqdm
+
+from squad.utils import get_word_span, get_word_idx, process_tokens
+from sklearn.manifold import TSNE
+import matplotlib.pyplot as plt
+from nltk.translate.bleu_score import sentence_bleu,corpus_bleu
+
+
+
+def main():
+    args = get_args()
+    prepro(args)
+
+
+def get_args():
+    parser = argparse.ArgumentParser()
+    home = os.path.expanduser("~")
+    home = os.path.join(home,"Documents","cs546")
+    print (home)
+    source_dir = os.path.join(home, "data", "narrativeqa-master")
+    target_dir = "data/narrativeqa"
+    glove_dir = os.path.join(home, "data", "glove")
+    parser.add_argument('-s', "--source_dir", default=source_dir)
+    parser.add_argument('-t', "--target_dir", default=target_dir)
+    parser.add_argument("--train_name", default='train-v1.1.json')
+    parser.add_argument('-d', "--debug", action='store_true')
+    parser.add_argument("--train_ratio", default=0.9, type=int)
+    parser.add_argument("--glove_corpus", default="6B")
+    parser.add_argument("--glove_dir", default=glove_dir)
+    parser.add_argument("--glove_vec_size", default=100, type=int)
+    parser.add_argument("--mode", default="full", type=str)
+    parser.add_argument("--single_path", default="", type=str)
+    parser.add_argument("--tokenizer", default="PTB", type=str)
+    parser.add_argument("--url", default="vision-server2.corp.ai2", type=str)
+    parser.add_argument("--port", default=8000, type=int)
+    parser.add_argument("--split", action='store_true')
+    parser.add_argument("--suffix", default="")
+    # TODO : put more args here
+    return parser.parse_args()
+
+
+def create_all(args):
+    out_path = os.path.join(args.source_dir, "all-v1.1.json")
+    if os.path.exists(out_path):
+        return
+    train_path = os.path.join(args.source_dir, args.train_name)
+    train_data = json.load(open(train_path, 'r'))
+    dev_path = os.path.join(args.source_dir, args.dev_name)
+    dev_data = json.load(open(dev_path, 'r'))
+    train_data['data'].extend(dev_data['data'])
+    print("dumping all data ...")
+    json.dump(train_data, open(out_path, 'w'))
+
+
+def prepro(args):
+    if not os.path.exists(args.target_dir):
+        os.makedirs(args.target_dir)
+
+    if args.mode == 'full':
+        prepro_each(args, 'train', out_name='train')
+        prepro_each(args, 'valid', out_name='dev')
+        prepro_each(args, 'test', out_name='test')
+    elif args.mode == 'all':
+        create_all(args)
+        prepro_each(args, 'dev', 0.0, 0.0, out_name='dev')
+        prepro_each(args, 'dev', 0.0, 0.0, out_name='test')
+        prepro_each(args, 'all', out_name='train')
+    elif args.mode == 'single':
+        assert len(args.single_path) > 0
+        prepro_each(args, "NULL", out_name="single", in_path=args.single_path)
+    else:
+        prepro_each(args, 'train', 0.0, args.train_ratio, out_name='train')
+        prepro_each(args, 'train', args.train_ratio, 1.0, out_name='dev')
+        prepro_each(args, 'dev', out_name='test')
+
+
+def save(args, data, shared, data_type):
+    data_path = os.path.join(args.target_dir, "data_{}.json".format(data_type))
+    shared_path = os.path.join(args.target_dir, "shared_{}.json".format(data_type))
+    json.dump(data, open(data_path, 'w'))
+    json.dump(shared, open(shared_path, 'w'))
+
+
+def get_word2vec(args, word_counter):
+    glove_path = os.path.join(args.glove_dir, "glove.{}.{}d.txt".format(args.glove_corpus, args.glove_vec_size))
+    sizes = {'6B': int(4e5), '42B': int(1.9e6), '840B': int(2.2e6), '2B': int(1.2e6)}
+    total = sizes[args.glove_corpus]
+    word2vec_dict = {}
+    with open(glove_path, 'r', encoding='utf-8') as fh:
+        for line in tqdm(fh, total=total):
+            array = line.lstrip().rstrip().split(" ")
+            word = array[0]
+            vector = list(map(float, array[1:]))
+            if word in word_counter:
+                word2vec_dict[word] = vector
+            elif word.capitalize() in word_counter:
+                word2vec_dict[word.capitalize()] = vector
+            elif word.lower() in word_counter:
+                word2vec_dict[word.lower()] = vector
+            elif word.upper() in word_counter:
+                word2vec_dict[word.upper()] = vector
+
+    print("{}/{} of word vocab have corresponding vectors in {}".format(len(word2vec_dict), len(word_counter), glove_path))
+    return word2vec_dict
+
+def break_summary_to_paras(summary):
+    len_summ = sum(list(map(len,summary)))
+    num_paras=5
+    para_size = len_summ/num_paras
+    para =[]
+    len_para=0
+    for sent in summary:
+        para.append(sent)
+        len_para+=len(sent)
+        if len_para > para_size:
+            yield para
+            para=[]
+            len_para=0
+    if para !=[]:
+        yield para
+
+def modify_answer_spans(qas,summary):
+    #converts span from (sent_num, word_num) -> (0,total_word_num in para)
+    import nltk
+    summary_tokenized = list(map(nltk.word_tokenize, nltk.sent_tokenize(summary)))
+    #summary_tokenized = [process_tokens(tokens) for tokens in summary_tokenized]
+
+    for index, qa in qas.iterrows():
+        answer1_span_start_idx = qa['start_index'].split(', ')
+        answer1_span_end_idx = qa['end_index'].split(', ')
+        answer1_span_start_idx = list(map(int, answer1_span_start_idx))
+        answer1_span_end_idx = list(map(int, answer1_span_end_idx))
+        index_mod = sum(map(len,summary_tokenized[0:answer1_span_start_idx[0]]))
+        qas.at[index,'start_index'] = [0,index_mod + answer1_span_start_idx[1]]
+        index_mod = sum(map(len, summary_tokenized[0:answer1_span_end_idx[0]]))
+        qas.at[index,'end_index'] = [0, index_mod + answer1_span_end_idx[1]]
+    return qas
+
+
+def prepro_each(args, data_type, start_ratio=0.0, stop_ratio=1.0, out_name="default", in_path=None):
+    if args.tokenizer == "PTB":
+        import nltk
+        sent_tokenize = nltk.sent_tokenize
+        def word_tokenize(tokens):
+            return [token.replace("''", '"').replace("``", '"') for token in nltk.word_tokenize(tokens)]
+    elif args.tokenizer == 'Stanford':
+        from my.corenlp_interface import CoreNLPInterface
+        interface = CoreNLPInterface(args.url, args.port)
+        sent_tokenize = interface.split_doc
+        word_tokenize = interface.split_sent
+    else:
+        raise Exception()
+
+    if not args.split:
+        sent_tokenize = lambda para: [para]
+
+    source_path = in_path or os.path.join(args.source_dir, "third_party","wikipedia")
+    #source_summaries =  pd.read_csv(source_path + '/summaries.csv')
+    source_summaries =  pd.read_csv('/Users/dhruv100691/Documents/cs546/CS-546--Narrative-QA/bi-att-flow-dev/processed_summaries_new_method.csv')
+    #source_qas = pd.read_csv(args.source_dir + '/qaps.csv')
+    source_qas = pd.read_csv('/Users/dhruv100691/Documents/cs546/CS-546--Narrative-QA/bi-att-flow-dev/processed_answer_spans_rogue_new_method.csv')
+    #could not find spans for some answers, so dropping those qa pairs
+    source_qas['start_index'] = source_qas['start_index'].str.replace('(','').str.replace(')','')
+    source_qas['end_index'] = source_qas['end_index'].str.replace('(','').str.replace(')','')
+    source_qas.dropna(subset=['start_index','end_index'],inplace=True)
+
+    summaries =[]
+    summaries_char_list = []
+    ques_answers = []
+    questions = []
+    questions_char_list =[]
+    ques_answer_lengths = []
+    ques_answer_spans = []
+    document_ids = []
+    word_counter, char_counter, lower_word_counter = Counter(), Counter(), Counter()
+    summary_index = -1
+    len_summ=0
+    num_summ=0
+    avg_len_sent =0
+    num_words =0
+    bleu_scores=[]
+    bleu_4_scores=[]
+    for index_summ, row in tqdm(source_summaries.iterrows(),total=1572):
+        if data_type == row['set']:
+            len_sent = 0
+            spans=[]
+            references=[]
+            summary_tokenized_paras=[]
+            summary_char_para = []
+            #row['processed_summary'] = row['processed_summary'].replace(".",". ")
+            summary_tokenized = list(map(word_tokenize,sent_tokenize(row['processed_summary'])))
+            #summary_tokenized = [process_tokens(tokens) for tokens in summary_tokenized]
+            char_list = [[list(word) for word in sent] for sent in summary_tokenized]
+            summary_tokenized_paras.append(summary_tokenized)
+            #summaries.append(list(break_summary_to_paras(summary_tokenized)))
+            summaries.append(summary_tokenized_paras)
+            num_summ += 1
+            summary_char_para.append(char_list)# TODO:each summary has only one paragraph
+            summaries_char_list.append(summary_char_para)
+            #coz train/test/valid all are in one file, index_summ cannot be used
+            summary_index = summary_index + 1
+            len_summ += len(summary_tokenized)
+
+            qas = source_qas[source_qas['document_id'].isin([row['document_id']])]
+            qas= modify_answer_spans(qas,row['processed_summary'])
+
+            for sent in summary_tokenized:
+                len_sent += len(sent)
+                num_words+= len(sent)
+                for word in sent:
+                    word_counter[word] += len(qas)
+                    lower_word_counter[word.lower()] += len(qas)
+                    for char in word:
+                        char_counter[char] += len(qas)
+            avg_len_sent += (len_sent / float(len(summary_tokenized)))
+            for index,qa in qas.iterrows() :
+                #if question is of multiple sentences, not handling that case also
+                #Not req most probably
+                question_tokenized = word_tokenize(qa['processed_question'])
+                #question_tokenized = process_tokens(question_tokenized)
+                #print (question_tokenized)
+                question_char_list = [list(word) for word in question_tokenized]
+
+                answer1_tokenized = list(map(word_tokenize, sent_tokenize(qa['processed_answer'].replace(".","")))) ##TODO
+                #answer1_tokenized = [process_tokens(tokens) for tokens in answer1_tokenized]
+                answer1_eos = answer1_tokenized[len(answer1_tokenized)-1] + ['</s>'] #appending end token
+                answer1_sos = ['--SOS--'] + answer1_tokenized[0]
+                target_length=len(answer1_eos)
+
+                answer1_span_start_idx = qa['start_index']
+                answer1_span_end_idx = qa['end_index']
+
+                #answer2_tokenized = list(map(word_tokenize, sent_tokenize(qa['answer2'])))
+                #answer2_tokenized = [process_tokens(tokens) for tokens in answer2_tokenized]
+                #answer2_eos = answer2_tokenized[len(answer2_tokenized) - 1] + ['</s>']  # appending end token
+                #answer2_sos = ['--SOS--'] + answer2_tokenized[0]
+                #print(answer2_tokenized)
+
+                predicted_rouge_span= summary_tokenized[0][answer1_span_start_idx[1]:answer1_span_end_idx[1]+1]
+                references.append([list(map(str.lower,answer1_tokenized[0]))])
+                spans.append(list(map(str.lower,predicted_rouge_span)))
+
+                ques_answers.append([answer1_sos,answer1_eos])
+                ques_answer_spans.append([answer1_span_start_idx,answer1_span_end_idx])
+                ques_answer_lengths.append(target_length)
+
+                questions.append(question_tokenized)
+                questions_char_list.append(question_char_list)
+                document_ids.append([summary_index,row['document_id']])
+
+                for sent in question_tokenized:
+                    for word in sent:
+                        word_counter[word] += 1
+                        lower_word_counter[word.lower()] += 1
+                        for char in word:
+                            char_counter[char] += 1
+
+
+            bleu_scores.append(corpus_bleu(references, spans, weights=(1, 0, 0, 0)))
+            bleu_4_scores.append(corpus_bleu(references, spans))
+    print("Average score bleu_1 for", data_type, sum(bleu_scores) / len(bleu_scores))
+    print("Average score bleu_4 for", data_type, sum(bleu_4_scores) / len(bleu_4_scores))
+
+    word2vec_dict = get_word2vec(args, word_counter)
+    lower_word2vec_dict = get_word2vec(args, lower_word_counter)
+
+    data = {'q': questions, 'cq': questions_char_list, '*x': document_ids,
+            'answerss': ques_answers , '*cx': document_ids ,'ans_len': ques_answer_lengths,
+             'spans': ques_answer_spans}
+    shared = {'x': summaries, 'cx': summaries_char_list,'word_counter': word_counter,
+              'char_counter': char_counter, 'lower_word_counter': lower_word_counter,
+              'word2vec': word2vec_dict, 'lower_word2vec': lower_word2vec_dict}
+
+    print("saving ...")
+    save(args, data, shared, out_name)
+
+    print ("{} statistics".format(data_type))
+    print (" Number of summaries :",num_summ)
+    print (" Average summary length : ", len_summ/float(num_summ) )
+    print (" Average sentence lengths :", avg_len_sent/float(num_summ))
+    print (" Average number of words :", num_words/float(num_summ))
+
+    #visualize_embeddings(lower_word2vec_dict)
+
+def visualize_embeddings(word2vec_dict):
+    import nltk
+    STOP_WORDS = nltk.corpus.stopwords.words()
+    labels = []
+    tokens = []
+    for key,val in word2vec_dict.items():
+        if key not in STOP_WORDS:
+            labels.append(key)
+        tokens.append(val)
+
+    tsne_model = TSNE(perplexity=40, n_components=2, init='pca', n_iter=2500, random_state=23)
+    new_values = tsne_model.fit_transform(tokens)
+    x = []
+    y = []
+    for value in new_values:
+        x.append(value[0])
+        y.append(value[1])
+
+    plt.figure(figsize=(16, 16))
+    for i in range(len(x)):
+        plt.scatter(x[i], y[i])
+        plt.annotate(labels[i],
+                     xy=(x[i], y[i]),
+                     xytext=(5, 2),
+                     textcoords='offset points',
+                     ha='right',
+                     va='bottom')
+    plt.show()
+
+if __name__ == "__main__":
+    main()
